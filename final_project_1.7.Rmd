@@ -67,7 +67,7 @@ saveRDS(ns_joined, "ns_joined.RDS")
 ```
 
 ```{r clean-ns-data}
-ns_joined <- readRDS("ns_joined.RDS")
+ns_joined <- readRDS("data/ns_joined.RDS")
 
 # select desired variables from nationscape dataset and recode for readability
 
@@ -254,7 +254,7 @@ saveRDS(nyt_police, "nyt_police.RDS")
 ```
 
 ```{r clean-nyt}
-nyt_police <- readRDS("nyt_police.RDS")
+nyt_police <- readRDS("data/nyt_police.RDS")
 
 # select and filter nyt search data
 
@@ -400,7 +400,7 @@ saveRDS(nyt_sentiment, "nyt_sentiment.RDS")
 ```
 
 ```{r nyt-sentiment-viz}
-nyt_sentiment <- readRDS("nyt_sentiment.RDS")
+nyt_sentiment <- readRDS("data/nyt_sentiment.RDS")
 
 # visualize sentiment scores
 
@@ -440,7 +440,7 @@ Outputs:
 -   day_sentiments(): a function used to extract the mean headline, lead, and article sentiment for a specified date. Use ns_nyt_dates to loop through every combination of 7 day periods that are possible for NS data
 -   ns_nyt_joined.RDS: a data frame combining NS and NYT data. Each row corresponds to one observation from the NS survey (individual respondent), a columns include NYT article sentiments for 7 days prior to NS observation.
 
-```{r ns-nyt-join, eval=TRUE}
+```{r ns-nyt-join, eval=FALSE}
 # calculate average nyt police article sentiment for every nationscape
 # respondent. nationscape's nyt indicator variable is TRUE for respondents who
 # have consumed political news in the last week -- calculate average nyt
@@ -509,7 +509,7 @@ saveRDS(ns_nyt_joined, "ns_nyt_joined.RDS")
 # Initial visualization
 
 ```{r ns-viz}
-ns_nyt_joined <- readRDS("ns_nyt_joined.RDS")
+ns_nyt_joined <- readRDS("data/ns_nyt_joined.RDS")
 nyt_labs <- c("NYT true", "NYT false")
 names(nyt_labs) <- c("TRUE", "FALSE")
 
@@ -676,12 +676,14 @@ ns_nyt_joined %>%
 
 # Models
 
-```{r draft-models, eval=FALSE}
+```{r}
 model_data <- ns_nyt_joined %>% 
   mutate(post = date > "2020-5-28",
          day_running = as.numeric(date - ymd("2020-5-28")),
          race = factor(race, levels = c("white", "black", "asian", "native", "other")))
+```
 
+```{r draft-models, eval=FALSE}
 m1 <- lm(formula = police ~ article_0 + article_1 + article_2 + article_3 + article_4 + article_5 + article_6 + 
            party + race + gender + cnn + fox, data = model_data %>% filter(nyt == T))
 
@@ -776,7 +778,6 @@ stargazer(dem_rdd, rep_rdd, ind_rdd,
           dep.var.caption = "Police favorability",
           out = "figures/table_3.html")
 ```
-
 ```{r write-up-plots, eval=FALSE}
 viz_3 <- ns_nyt_joined %>% 
   group_by(date, nyt) %>% 
