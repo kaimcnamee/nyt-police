@@ -855,11 +855,14 @@ fig_3 <- ggplot() +
   geom_vline(xintercept = as.Date("2020-5-28"), lty = "dashed") +
   facet_grid(party ~ nyt, labeller = labeller(nyt = nyt_labs)) +
   theme_light() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.5, hjust = 0.5)) + 
   labs(x = "",
        y = "Scaled average",
        title = "FGURE 3: Average article sentiment and police favorability by day",
        subtitle = "Before and after the beginning of summer 2020 protests") +
   scale_color_discrete(name = "", labels = c("Article sentiment", "Police favorability"))
+
+fig_3
 
 ggsave(plot = fig_3, "figure_3.png", device = "png", dpi = 300, path = "figures", 
        height = 7, width = 7)
