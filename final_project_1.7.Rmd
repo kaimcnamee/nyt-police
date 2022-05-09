@@ -1,0 +1,867 @@
+---
+title: "final project"
+author: "Kai McNamee"
+date: "4/2/2022"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+# knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(sjlabelled)
+library(haven)
+library(lubridate)
+library(jsonlite)
+library(tidytext)
+library(sentimentr)
+library(janitor)
+library(stargazer)
+set.seed(02138)
+```
+
+# Read and clean data
+
+## Nationscape data
+
+Read and clean all waves of Nationscape data.
+
+Outputs:
+
+-   ns_joined.RDS: joined waves of NS data
+-   ns_selected: cleaned NS data
+
+```{r read-ns-data, message=FALSE, eval=FALSE}
+
+# define data paths for nationscape data to streamline read process 
+
+phase1_path <- "data/Nationscape-Weekly-Materials-DTA-2021Dec/phase_1_v20210301/"
+phase2_path <- "data/Nationscape-Weekly-Materials-DTA-2021Dec/phase_2_v20210301/"
+phase3_path <- "data/Nationscape-Weekly-Materials-DTA-2021Dec/phase_3_v20210301/"
+
+file_names_1 <- list.files(phase1_path) %>% .[1:24]
+file_names_2 <- list.files(phase2_path) %>% .[1:26]
+file_names_3 <- list.files(phase3_path) %>% .[1:27]
+
+# write a function to readns data using map_dfr to iterate through files
+
+read_ns <- function(phase_path, file_names){
+  map_dfr(.x = file_names, 
+                   ~read_dta(file = str_c(phase_path, ., "/", ., ".dta")) %>% 
+                     remove_all_labels()) %>%   
+  mutate(across(.cols = everything(), ~na_if(., 999))) %>% 
+  mutate(across(.cols = everything(), ~na_if(., 888)))
+}
+
+phase1 <- read_ns(phase_path = phase1_path, file_names = file_names_1)
+phase2 <- read_ns(phase_path = phase2_path, file_names = file_names_2) 
+phase3 <- read_ns(phase_path = phase3_path, file_names = file_names_3)
+
+# set message=FALSE in chunk settings to suppress full_join "by = c(...)" message
+
+ns_joined <- full_join(phase1, phase2, all = T) %>% 
+  full_join(phase3, all = T)
+
+saveRDS(ns_joined, "ns_joined.RDS")
+```
+
+```{r clean-ns-data}
+ns_joined <- readRDS("ns_joined.RDS")
+
+# select desired variables from nationscape dataset and recode for readability
+
+ns_vars <- c(party = "pid3", 
+             gender = "gender",
+             race = "race_ethnicity",
+             state = "state",
+             nyt = "news_sources_new_york_times",
+             fox = "news_sources_fox",
+             cnn = "news_sources_cnn",
+             police = "group_favorability_the_police")
+
+ns_selected <- ns_joined %>% 
+  select(response_id, start_date, all_of(ns_vars)) %>% 
+  mutate(party = case_when(party == 1 ~ "Democrat",
+                           party == 2 ~ "Republican",
+                           party == 3 ~ "Independent",
+                           T ~ NA_character_),
+         race = case_when(race == 1 ~ "white",
+                          race == 2 ~ "black",
+                          race == 3 ~ "native",
+                          race >= 4 & race <= 14 ~ "asian",
+                          T ~ "other"),
+         gender = ifelse(gender == 1, "female", "male"), 
+         nyt = ifelse(nyt == 1, TRUE, FALSE),
+         fox = ifelse(fox == 1, TRUE, FALSE),
+         cnn = ifelse(cnn == 1, TRUE, FALSE),
+         start_date = as_date(start_date),
+         
+         # invert ns group_favorability_police such that 1 = least favorable
+         # (makes it more intuitive to interpret when sentiment is negative to
+         # positive for both articles and attitudes towards police)
+         
+         police = 5 - police) %>% 
+  rename(date = start_date)
+
+min(ns_selected$date)
+# "2019-07-18"
+max(ns_selected$date)
+# "2021-01-16"
+```
+
+## New York Times data
+
+### Scrape NYT
+
+Read and clean NYT data for the dates included in Nationscape data (2019-07-18 to 2021-01-16).
+
+Outputs:
+
+-   base_queries_police.RDS: a data frame containing a column of URLS to plug into api function
+-   nyt_police.RDS: a joined data frame containing the results of all NYT API calls
+-   nyt_clean: NYT data filtered by relevant sections and news desks
+
+```{r prepare-nyt-api, eval=FALSE}
+# ns data 2019-07-18 through 2021-01-16
+
+# generate urls for api calls for every month of ns data to stay under nyt api's
+# pagination limit (limited to 100 pages per api search)
+
+term <- "police" 
+api_months <- tibble(begin_date = seq(as.Date("2019-07-02"), 
+                                      as.Date("2021-02-02"), by = "month"),
+                     end_date = seq(as.Date("2019-08-01"), 
+                                      as.Date("2021-03-01"), by = "month")) %>% 
+  mutate(begin_date = as_character(str_remove_all(begin_date, "-")),
+         end_date = as_character(str_remove_all(end_date, "-")))
+
+# run initial api call to extract number of pages each date range returns
+
+base_queries <- tibble(begin_date = seq(as.Date("2019-07-02"), 
+                                      as.Date("2021-02-02"), by = "month"),
+                     end_date = seq(as.Date("2019-08-01"), 
+                                      as.Date("2021-03-01"), by = "month")) %>% 
+  mutate(begin_date = as_character(str_remove_all(begin_date, "-")),
+         end_date = as_character(str_remove_all(end_date, "-")),
+         base_url = str_c("http://api.nytimes.com/svc/search/v2/articlesearch.json?q=", 
+                                 term, "&begin_date=", begin_date, "&end_date=", end_date, 
+                                 "&facet_filter=true&api-key=", 
+                                 Sys.getenv("NYT_API_KEY")))
+
+base_pages <- tibble(hits = numeric(), max_pages = numeric())
+
+# loop through urls and save column indicating the number of pages in each api
+# call
+
+for (i in 1:nrow(base_queries)){
+  
+  search <- fromJSON(base_queries$base_url[[i]], flatten = TRUE) %>% 
+    data.frame() %>% 
+    slice(1) %>% 
+    select(response.meta.hits) %>% 
+    pull()
+  
+  message("Retrieving page ", i)
+  Sys.sleep(6)
+  
+  base_pages <- base_pages %>% 
+    add_row(hits = as.numeric(search),
+            max_pages = round((search/10)-1))
+  
+}
+
+base_queries <- base_queries %>% 
+  cbind(base_pages)
+
+saveRDS(base_queries, "base_queries_police.RDS")
+```
+
+```{r read-nyt, eval=FALSE}
+# use base_queries object to loop api calls -- subset base_queries_police to
+# break up calls and make sure everything is saving correctly
+
+base_queries_police <- readRDS("base_queries_police.RDS") %>%
+  mutate(url_id = row_number()) 
+
+# subset base queries to test function
+
+# test_queries_police <- base_queries_police %>%
+#   slice(1:4) %>%
+#   mutate(max_pages = c(4, 1, 0, 2))
+
+nyt_search <- function(urls, max_pages, start_url, end_url) {
+  
+  message("Time until finish: ", (sum(max_pages[start_url:end_url]*6/60)), " min")
+  
+  # urls: character vector of urls (base_queries_police$base_url) indexed by i
+  # max_pages: numeric vector; each entry corresponding to the max pages
+  # returned by an NYT api call to url i
+  # start_url: integer; indicates which position to start from urls
+  # end_url: integer; indicates which position to end from urls
+  
+  search_joined <<- tibble()
+  
+  # loop through urls
+  
+  for (i in start_url:end_url) {
+    
+    # loop through pages
+    
+    for (k in 0:max_pages[[i]]) {
+      
+      # define search object as NYT api call output for url i, pages 0 through k
+      
+      search <- fromJSON(paste0(urls[[i]], "&page=", k), flatten = TRUE) %>% 
+        data.frame() %>%
+        mutate(url_id = i)
+      
+      message("Retrieving page ", k, " of ", max_pages[[i]], " from url ", i)
+      
+      # recursively add NYT api call for url i page k to search_joined object
+      # note: assign search_joined globally so progress can be saved if function
+      # fails mid loop
+      
+      search_joined <<- bind_rows(search_joined, search)
+      Sys.sleep(6)
+    }
+  }
+  
+  # output search_joined object
+  
+  message("Done")
+  return(search_joined)
+  
+}
+
+# test api call
+
+# search_1 <- nyt_search(urls = base_queries_police$base_url, 
+#                        max_pages = base_queries_police$max_pages, 
+#                        start_url = 1, end_url = 1)
+
+# full api call
+
+# search_full <- nyt_search(urls = base_queries_police$base_url,
+#                           max_pages = base_queries_police$max_pages,
+#                           start_url = 1, end_url = length(base_queries_police))
+
+search_files <- c("1", "2", "3_4", "5", "6", "7_8", "9_10", "11_12", "13_17", 
+                  "18", "19_20")
+
+nyt_police <- map_df(.x = search_files, ~ readRDS(str_c("search_", ., ".RDS")))
+saveRDS(nyt_police, "nyt_police.RDS")
+```
+
+```{r clean-nyt}
+nyt_police <- readRDS("nyt_police.RDS")
+
+# select and filter nyt search data
+
+nyt_vars <- c("abstract" = "response.docs.abstract",
+              "lead" = "response.docs.lead_paragraph",
+              "date" = "response.docs.pub_date",
+              "news_desk" = "response.docs.news_desk",
+              "section" = "response.docs.section_name",
+              "headline" = "response.docs.headline.main")
+
+nyt_selected <- nyt_police %>% 
+  select(all_of(nyt_vars)) %>% 
+  mutate_all(na_if, "") %>%
+  separate(date, sep = "T", into = c("date", "time")) %>%
+  mutate(news_desk = as.factor(news_desk),
+         section = as.factor(section),
+         date = ymd(date)) %>% 
+  filter(!duplicated(headline))
+
+# note: articles are repeated when they're tagged with multiple sections
+    
+# define the relevant sections for analysis
+
+nyt_selected %>% 
+  count(news_desk) %>% 
+  filter(n > 50) %>% 
+  ggplot(aes(x = fct_reorder(news_desk, desc(n)), y = n)) +
+    geom_col() +
+    theme_light() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 6)) +
+    labs(x = "Desk", y = "Hits", 
+         title = "NYT article search for 'police' by desk",
+         caption = "Results between 2019-07-02 and 2021-03-01")
+
+nyt_selected %>% 
+  count(section) %>%
+  filter(n > 50) %>%
+  ggplot(aes(x = fct_reorder(section, desc(n)), y = n)) +
+    geom_col() +
+    theme_light() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 6)) +
+    labs(x = "Section", y = "Hits", 
+         title = "NYT article search for 'police' by section",
+         caption = "Results between 2019-07-02 and 2021-03-01")
+
+# filter for most relevant sections for analysis in the US (note: removed
+# "Opinion", "Editorial", and "OpEd' due to international results that aren't
+# easily filterable)
+
+key_words <- c("police")
+
+nyt_clean <- nyt_selected %>% 
+  filter(news_desk %in% c("Metro", "Metropolitan", "National", 
+                          "Express", "Washington", "Politics", 
+                          "Investigative", "U.S.", "New York") &
+           section != "World",
+         
+         # drop duplicated headlines and leads
+         
+         !duplicated(headline),
+         !duplicated(lead)) %>% 
+  droplevels() %>% 
+  
+  # create indicator variable coded as TRUE if headline, abstract, or lead
+  # contain explicit mention of key words
+  
+  mutate(police_mention = ifelse(str_detect(headline, 
+                                            regex(paste(key_words, collapse = "|"), 
+                                                  ignore_case = T)) == T |
+                                  str_detect(abstract,
+                                             regex(paste(key_words, collapse = "|"), 
+                                                  ignore_case = T)) == T | 
+                                  str_detect(lead,
+                                             regex(paste(key_words, collapse = "|"), 
+                                                  ignore_case = T)) == T, T, F))
+
+# visualize temporal distribution of data
+
+nyt_clean %>%
+  group_by(date) %>%
+  summarize(articles = n(), .groups = "drop") %>%
+  ggplot(aes(x = date, y = articles)) +
+    geom_point(size = 0.8, alpha = 0.5) +
+    geom_line(alpha = 0.5) +
+    theme(axis.text.x = element_text(angle = -45)) +
+  theme_light() +
+  labs(x = "",
+       y = "Articles",
+       title = "NYT articles returned for 'police' per day")
+
+nyt_clean %>% 
+  filter(police_mention == T) %>% 
+  group_by(date) %>%
+  summarize(articles = n(), .groups = "drop") %>%
+  ggplot(aes(x = date, y = articles)) +
+    geom_point(size = 0.8, alpha = 0.5) +
+    geom_line(alpha = 0.5) +
+    theme_light() +
+    labs(x = "",
+        y = "Articles",
+        title = "NYT articles that mention 'police' per day")
+```
+
+### NYT sentiments
+
+Generate sentiment scores using sentimentr's lexicon-based sentiment analysis.
+
+Outputs:
+
+-   nyt_sentiment: a data frame containing filtered NYT articles and
+corresponding sentiment scores of the headline and lead, and an estimated
+article sentiment score calculated as the average of the headline and lead
+weighted by the number of words in each.
+
+```{r nyt-sentiment, eval=FALSE}
+
+# separate nyt headlines and leads into sentences objects for sentimentr
+
+headlines <- get_sentences(nyt_clean$headline)
+leads <- get_sentences(nyt_clean$lead)
+
+headline_sentiment <- sentiment_by(headlines) %>% 
+  select(word_count, ave_sentiment) %>% 
+  rename("headline_sentiment" = ave_sentiment,
+         "headline_words" = word_count)
+
+# generate sentiment scores for headlines and leads
+
+lead_sentiment <- sentiment_by(leads) %>% 
+  select(word_count, ave_sentiment) %>% 
+  rename("lead_sentiment" = ave_sentiment,
+         "lead_words" = word_count)
+
+# combine headline sentiments and lead sentiments with original nyt data.
+# approximate "article sentiment" as weighted average of headline and lead.
+
+nyt_sentiment <- nyt_clean %>% 
+  cbind(headline_sentiment, lead_sentiment) %>% 
+  mutate(article_sentiment = (headline_words / (headline_words + lead_words) * headline_sentiment) +
+           (lead_words / (headline_words + lead_words) * lead_sentiment))
+
+saveRDS(nyt_sentiment, "nyt_sentiment.RDS")
+```
+
+```{r nyt-sentiment-viz}
+nyt_sentiment <- readRDS("nyt_sentiment.RDS")
+
+# visualize sentiment scores
+
+nyt_sentiment_plot <- nyt_sentiment %>% 
+  filter(police_mention == T) %>% 
+  ggplot(aes(x = article_sentiment,)) +
+    geom_histogram(aes(y =..count../sum(..count..)), bins = 75) +
+    theme_light() +
+    labs(x = "Article sentiment", y = "Proportion",
+         title = "New York Times article sentiments",
+         subtitle = "Articles between 2019-07 and 2021-03 that mention 'police'")
+
+nyt_sentiment_plot
+
+nyt_sentiment %>% 
+  filter(police_mention == T) %>% 
+  group_by(date) %>% 
+  summarize(mean_article = mean(article_sentiment), .groups = "drop") %>% 
+  ggplot(aes(x = date, y = mean_article)) +
+    geom_point(size = 0.5, alpha = 0.5) +
+    geom_line(alpha = 0.5) +
+    geom_smooth(method = "loess", formula = y ~ x)+
+    theme_light() +
+    labs(x = "",
+         y = "Average daily sentiment",
+         title = "Average sentiment score over time for all search results",
+         caption = "Results between 2019-07 and 2021-03 \nthat mention'police'")
+```
+
+## Join Nationscape and New York Times data
+
+Join Nationscape data and NYT sentiments.
+
+Outputs:
+
+-   ns_nyt_dates: a matrix of date ranges used to extract NYT sentiments for the 7 days prior to the date an individual responded to the NS survey
+-   day_sentiments(): a function used to extract the mean headline, lead, and article sentiment for a specified date. Use ns_nyt_dates to loop through every combination of 7 day periods that are possible for NS data
+-   ns_nyt_joined.RDS: a data frame combining NS and NYT data. Each row corresponds to one observation from the NS survey (individual respondent), a columns include NYT article sentiments for 7 days prior to NS observation.
+
+```{r ns-nyt-join, eval=TRUE}
+# calculate average nyt police article sentiment for every nationscape
+# respondent. nationscape's nyt indicator variable is TRUE for respondents who
+# have consumed political news in the last week -- calculate average nyt
+# sentiments for every unique week ending with respondent date (week starting on
+# date -7 and ending on date)
+
+# get date ranges to iterate function call
+
+ns_nyt_dates <- ns_selected %>%
+  
+  # note: every week of respondents includes at least 1 nyt reader
+  
+  group_by(date) %>% 
+  summarize(nyt = ifelse(sum(nyt) > 0, T, F)) %>% 
+  mutate(nyt_start = date - 7,
+         nyt_end = date,
+         day_0 = nyt_start + 0,
+         day_1 = nyt_start + 1,
+         day_2 = nyt_start + 2,
+         day_3 = nyt_start + 3,
+         day_4 = nyt_start + 4,
+         day_5 = nyt_start + 5,
+         day_6 = nyt_start + 6) %>% 
+  select(date, day_0:day_6) %>% 
+  pivot_longer(cols = day_0:day_6, names_to = "series", values_to = "values")
+
+# write a function to return mean of weighted article sentiment for specified
+# day
+
+get_nyt_sentiment<- function(day){
+  nyt_sentiment_day <- nyt_sentiment %>% 
+    filter(date == day & police_mention == T) %>% 
+    select(article_sentiment, headline_sentiment, lead_sentiment)
+  
+  return(data.frame(article = round(mean(nyt_sentiment_day$article_sentiment, na.rm = T), 3), 
+                    headline = round(mean(nyt_sentiment_day$headline_sentiment, na.rm = T), 3),
+                    lead = round(mean(nyt_sentiment_day$lead_sentiment, na.rm = T), 3)))
+}
+
+# use use map() to iterate get_nyt_sentiment() through ns_nyt_dates and extract
+# mean sentiments for every 7 days leading up to NS  observation date. pivot
+# wider for easier rowwise calculations and model specification
+
+day_sentiments <- map_dfr(.x = ns_nyt_dates$values, ~ get_nyt_sentiment(.)) %>% 
+  mutate(date = ns_nyt_dates$date,
+         nyt_day = ns_nyt_dates$series) %>% 
+  pivot_longer(cols = article:lead, names_to = "scope", values_to = "sentiment") %>% 
+  mutate(scope = str_c(scope, str_sub(nyt_day, 4, 5))) %>% 
+  select(date, scope, sentiment) %>% 
+  pivot_wider(names_from = scope, values_from = sentiment)
+
+ns_nyt_joined <- ns_selected %>% 
+  left_join(day_sentiments, by = "date") %>% 
+  rowwise() %>% 
+  mutate(article_week = mean(c(article_0, article_1, article_2, article_3, 
+                               article_4, article_5, article_6), na.rm = T),
+         headline_week = mean(c(headline_0, headline_1, headline_2, headline_3, 
+                                headline_4, headline_5, headline_6), na.rm = T),
+         lead_week = mean(c(lead_0, lead_1, lead_2, lead_3, lead_4, lead_5, 
+                            lead_6), na.rm = T)) %>% 
+  ungroup()
+
+saveRDS(ns_nyt_joined, "ns_nyt_joined.RDS")
+```
+
+# Initial visualization
+
+```{r ns-viz}
+ns_nyt_joined <- readRDS("ns_nyt_joined.RDS")
+nyt_labs <- c("NYT true", "NYT false")
+names(nyt_labs) <- c("TRUE", "FALSE")
+
+# plot ns data
+
+# who reads nyt? 
+
+ns_nyt_joined %>% 
+  count(nyt, party) %>% 
+  drop_na() %>% 
+  ggplot(aes(x = nyt, y = n, fill = party)) +
+    geom_col(position = "dodge") +
+    theme_light()
+
+t.test(ns_nyt_joined$nyt[ns_nyt_joined$party == "Democrat"], 
+       ns_nyt_joined$nyt[ns_nyt_joined$party == "Republican"])
+
+# favorability towards police ~ day
+
+ns_nyt_joined %>% 
+  group_by(date) %>%
+  drop_na(race, police) %>% 
+  summarize(mean_police = mean(police), .groups = "drop") %>% 
+  ggplot(aes(x = date, y = mean_police)) +
+    geom_point(size = 0.8, alpha = 0.5) +
+    theme_light() +
+    labs(x = "", 
+         y = "Favorability towards police",
+         title = "Favorability towards police over time")
+
+# favorability towards police ~ day by race
+
+ns_nyt_joined %>% 
+  group_by(date, race) %>%
+  drop_na(race, police) %>% 
+  summarize(mean_police = mean(police), .groups = "drop") %>% 
+  ggplot(aes(x = date, y = mean_police, color = race)) +
+    geom_point(size = 0.8, alpha = 0.5) +
+    facet_wrap("race") +
+    theme_light() +
+    theme(axis.text.x = element_text(angle = -90)) +
+    labs(x = "", 
+         y = "Favorability towards police",
+         title = "Favorability towards police over time by race")
+
+# favorability towards police ~ day by party
+
+ns_nyt_joined %>% 
+  group_by(date, party) %>%
+  drop_na(party, police) %>% 
+  summarize(mean_police = mean(police), .groups = "drop") %>% 
+  ggplot(aes(x = date, y = mean_police, color = party)) +
+    geom_point(size = 0.8, alpha = 0.5) +
+    facet_wrap("party") +
+    theme_light() +
+    theme(axis.text.x = element_text(angle = -90)) +
+    labs(x = "", 
+         y = "Favorability towards police",
+         title = "Favorability towards police over time by party")
+
+# favorability towards police ~ day by news source
+
+ns_nyt_joined %>% 
+  group_by(date, nyt) %>%
+  drop_na(nyt, police) %>% 
+  summarize(mean_police = mean(police), .groups = "drop") %>% 
+  ggplot(aes(x = date, y = mean_police, color = nyt)) +
+    geom_point(size = 0.8, alpha = 0.5) +
+    geom_smooth(method = "loess") +
+    facet_wrap("nyt", labeller = labeller(nyt = nyt_labs)) +
+    theme_light() +
+    theme(axis.text.x = element_text(angle = -90), legend.position = "none") +
+    labs(x = "", 
+         y = "Favorability towards police",
+         title = "Favorability towards police over time")
+```
+
+
+```{r nyt-viz}
+nyt_labs <- c("NYT true", "NYT false")
+names(nyt_labs) <- c("TRUE", "FALSE")
+
+# scaled time series plot -- article sentiment and police favorability
+
+viz_1 <- ns_nyt_joined %>% 
+  group_by(date, nyt) %>% 
+  drop_na(police, article_week, headline_week, lead_week) %>% 
+  summarize(mean_police = mean(police),
+            mean_article = mean(article_week),
+            .groups = "drop") %>% 
+  mutate(scale_police = scale(mean_police),
+         scale_article = scale(mean_article))
+
+viz_1 %>%   
+  select(date, nyt, scale_police:scale_article) %>% 
+  pivot_longer(cols = scale_police:scale_article, names_to = "series", values_to = "values") %>% 
+  filter(series == "scale_police" | series == "scale_article", 
+         date != "2020-08-12") %>%
+  ggplot(aes(x = date, y = values, color = series)) +
+    geom_point(size = 0.5, alpha = 0.5) + 
+    geom_line(alpha = 0.25) +
+    geom_smooth(se = F, method = "loess", formula = y ~ x) +
+    theme_light() +
+    facet_wrap("nyt") +
+    labs(x = "",
+         y = "Scaled average",
+         title = "Average article sentiment and police favorability by day") +
+    scale_color_discrete(name = "", labels = c("Article sentiment", "Police favorability"))
+
+
+# scaled time series with discontinuity
+
+viz_2 <- ns_nyt_joined %>% 
+  drop_na(party) %>% 
+  group_by(date, nyt, party) %>% 
+  drop_na(police, article_week, headline_week, lead_week) %>% 
+  summarize(mean_police = mean(police),
+            mean_article = mean(article_week),
+            .groups = "drop") %>% 
+  mutate(scale_police = scale(mean_police),
+         scale_article = scale(mean_article),
+         pre = date < "2020-5-28") %>% 
+
+  # drop 1 outlier for readability
+  filter(date != "2020-08-12") %>% 
+  select(date, party, nyt, pre, scale_police:scale_article) %>% 
+  pivot_longer(cols = scale_police:scale_article, names_to = "series", values_to = "values") 
+
+ggplot() +
+  geom_point(data = viz_2, aes(x = date, y = values, color = series),
+             size = 0.5, alpha = 0.5) +
+  geom_smooth(data = viz_2 %>% filter(pre == T), 
+              aes(color = series, x = date, y = values),
+              size = 0.8,
+              method = "loess", formula = y ~ x, se = F) +
+  geom_smooth(data = viz_2 %>% filter(pre == F), 
+              aes(color = series, x = date, y = values),
+              size = 0.8,
+              method = "loess", formula = y ~ x, se = F) + 
+  geom_vline(xintercept = as.Date("2020-5-28"), lty = "dashed") +
+  facet_grid(nyt ~ party, labeller = labeller(nyt = nyt_labs)) +
+  theme_light() +
+  labs(x = "",
+       y = "Scaled average",
+       title = "Average article sentiment and police favorability by day",
+       subtitle = "Before and after the beginning of summer 2020 protests") +
+  scale_color_discrete(name = "", labels = c("Article sentiment", "Police favorability"))
+
+```
+
+```{r nyt-ns-viz}
+ns_nyt_joined %>% 
+  drop_na(article_week, police) %>%  
+  ggplot(aes(x = article_week, y = police, color = nyt)) +
+    geom_jitter(size = 0.5, alpha = 0.05) + 
+    geom_smooth(method = "lm", color = "black") +
+    facet_wrap("nyt", labeller = labeller(nyt = nyt_labs)) +
+    theme_light() +
+    theme(legend.position = "none") +
+    labs(x = "Police favorability",
+         y = "Article sentiment",
+         title ="Police favorability over article sentiment")
+```
+
+# Models
+
+```{r draft-models, eval=FALSE}
+model_data <- ns_nyt_joined %>% 
+  mutate(post = date > "2020-5-28",
+         day_running = as.numeric(date - ymd("2020-5-28")),
+         race = factor(race, levels = c("white", "black", "asian", "native", "other")))
+
+m1 <- lm(formula = police ~ article_0 + article_1 + article_2 + article_3 + article_4 + article_5 + article_6 + 
+           party + race + gender + cnn + fox, data = model_data %>% filter(nyt == T))
+
+
+m2 <- lm(formula = police ~ article_week + party + race + gender + cnn + fox, data = model_data %>% filter(nyt == T))
+
+m3 <- lm(formula = police ~ article_week*race, data = model_data)
+
+summary(m1)
+summary(m2)
+stargazer(m1, m2, type = "text")
+```
+
+```{r final-models}
+# model subsetted by reader status
+
+nyt_t <- lm(data = model_data %>% filter(nyt == T), 
+              formula = police ~ article_week + party + race + gender + cnn + fox)
+
+nyt_f <- lm(data = model_data %>% filter(nyt == F), 
+              formula = police ~ article_week + party + race + gender + cnn + fox)
+
+stargazer(nyt_t, nyt_f, 
+          type = "html",
+          dep.var.labels.include = F,
+          covariate.labels = c("Article sentiment", 
+                               "Party: Independent",
+                               "Party: Republican",
+                               "Race: Black",
+                               "Race: Asian",
+                               "Race: Native American",
+                               "Race: Other",
+                               "Gender: Male",
+                               "CNN",
+                               "Fox"),
+          title = "TABLE 1: Police favorability by reader status",
+          column.labels = c("NYT readers", "NYT non-readers"),
+          dep.var.caption = "Police favorability",
+          out = "figures/table_1.html")
+
+# model including readers and non readers of the Times, split by party
+
+dem_nyt <- lm(data = model_data %>% filter(party == "Democrat"), 
+              formula = police ~ nyt*article_week + race + gender + cnn + fox)
+
+rep_nyt <- lm(data = model_data %>% filter(party == "Republican"), 
+              formula = police ~ nyt*article_week + race + gender + cnn + fox)
+
+ind_nyt <- lm(data = model_data %>% filter(party == "Independent"), 
+              formula = police ~ nyt*article_week + race + gender + cnn + fox)
+
+stargazer(dem_nyt, rep_nyt, ind_nyt, 
+          type = "html",
+          dep.var.labels.include = F,
+          covariate.labels = c("NYT reader",
+                               "Article sentiment",
+                               "Race: Black",
+                               "Race: Asian",
+                               "Race: Native American",
+                               "Race: Other",
+                               "Gender: Male",
+                               "CNN",
+                               "Fox",
+                               "NYT reader*Article sentiment"),
+          title = "TABLE 2: Police favorability by party",
+          column.labels = c("Democrats", "Republicans", "Independents"),
+          dep.var.caption = "Police favorability",
+          
+          out = "figures/table_2.html")
+
+# RDD model
+
+dem_rdd <- lm(data = model_data %>% filter(nyt == T & party == "Democrat"),
+              formula = police ~ day_running*post + article_week*post)
+
+rep_rdd <- lm(data = model_data %>% filter(nyt == T & party == "Republican"),
+                formula = police ~ day_running*post + article_week*post)
+
+ind_rdd <- lm(data = model_data %>% filter(nyt == T & party == "Independent"),
+                formula = police ~ day_running*post + article_week*post)
+
+stargazer(dem_rdd, rep_rdd, ind_rdd,
+          type = "html",
+          dep.var.labels.include = F,
+          covariate.labels = c("Day",
+                               "Post",
+                               "Article sentiment",
+                               "Day*Post",
+                               "Article sentiment*Post"),
+          title = "TABLE 3: NYT readers' police favorability by party (RDD)",
+          column.labels = c("Democrats", "Republicans", "Independents"),
+          dep.var.caption = "Police favorability",
+          out = "figures/table_3.html")
+```
+
+```{r write-up-plots, eval=FALSE}
+viz_3 <- ns_nyt_joined %>% 
+  group_by(date, nyt) %>% 
+  drop_na(police, article_week, headline_week, lead_week) %>% 
+  summarize(mean_police = mean(police),
+            mean_article = mean(article_week),
+            pre = date < "2020-5-28",
+            .groups = "drop") %>% 
+  
+  # drop outlier for readability
+  
+  filter(date != "2020-08-12") 
+
+fig_1 <- ggplot() +
+  geom_point(data = viz_3, 
+             aes(x = date, y = mean_police, color = nyt),
+             size = 0.5, alpha = 0.25) +
+  geom_smooth(data = viz_3 %>% filter(pre == T), 
+              aes(x = date, y = mean_police, color = nyt),
+              size = 0.75,
+              method = "lm",
+              formula = y ~ x) +
+  geom_smooth(data = viz_3 %>% filter(pre == F), 
+              aes(x = date, y = mean_police, color = nyt),
+              size = 0.75,
+              method = "lm",
+              formula = y ~ x) +
+  geom_vline(xintercept = as.Date("2020-5-28"), lty = "dashed") +
+  facet_wrap("nyt", labeller = labeller(nyt = nyt_labs)) +
+  theme_light() +
+  theme(legend.position = "none",
+        axis.title.x.bottom = ) +
+  labs(title = "FIGURE 1: Average daily police favorability",
+       y = "Police favorability",
+       x = "")
+
+ggsave(plot = fig_1, "figure_1.png", device = "png", dpi = 300, path = "figures", 
+       height = 6, width = 10)
+
+fig_2 <- ns_nyt_joined %>% 
+  drop_na(article_week, police) %>%  
+  ggplot(aes(x = article_week, y = police, color = nyt)) +
+    geom_jitter(size = 0.5, alpha = 0.05) + 
+    geom_smooth(method = "lm", color = "black") +
+    facet_wrap("nyt", labeller = labeller(nyt = nyt_labs)) +
+    theme_light() +
+    theme(legend.position = "none") +
+    labs(x = "Article sentiment",
+         y = "Police favorability",
+         title ="FIGURE 2: Police favorability over article sentiment")
+
+# fig_2 <- nyt_sentiment %>% 
+#   filter(police_mention == T) %>% 
+#   ggplot(aes(x = article_sentiment,)) +
+#     geom_histogram(aes(y =..count../sum(..count..)), bins = 75) +
+#     theme_light() +
+#     labs(x = "Article sentiment", y = "Proportion",
+#          title = "FIGURE 2: New York Times article sentiments",
+#          subtitle = "Articles between 2019-07 and 2021-03 that mention 'police'")
+
+ggsave(plot = fig_2, "figure_2.png", device = "png", dpi = 300, path = "figures", 
+       height = 6, width = 10)
+
+fig_3 <- ggplot() +
+  geom_point(data = viz_2, aes(x = date, y = values, color = series),
+             size = 0.5, alpha = 0.5) +
+  geom_smooth(data = viz_2 %>% filter(pre == T), 
+              aes(color = series, x = date, y = values),
+              size = 0.8,
+              method = "lm", formula = y ~ x, se = F) +
+  geom_smooth(data = viz_2 %>% filter(pre == F), 
+              aes(color = series, x = date, y = values),
+              size = 0.8,
+              method = "lm", formula = y ~ x, se = F) + 
+  geom_vline(xintercept = as.Date("2020-5-28"), lty = "dashed") +
+  facet_grid(party ~ nyt, labeller = labeller(nyt = nyt_labs)) +
+  theme_light() +
+  labs(x = "",
+       y = "Scaled average",
+       title = "FGURE 3: Average article sentiment and police favorability by day",
+       subtitle = "Before and after the beginning of summer 2020 protests") +
+  scale_color_discrete(name = "", labels = c("Article sentiment", "Police favorability"))
+
+ggsave(plot = fig_3, "figure_3.png", device = "png", dpi = 300, path = "figures", 
+       height = 7, width = 7)
+```
+
+
